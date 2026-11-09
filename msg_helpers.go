@@ -266,15 +266,23 @@ func unpackString(msg []byte, off int) (string, int, error) {
 	if off+l > len(msg) {
 		return "", off, &Error{err: "overflow unpacking txt"}
 	}
+	return fromWireOctets(msg[off : off+l]), off + l, nil
+}
+
+// fromWireOctets escapes a raw wire octet sequence into the presentation
+// form used by character-strings (RFC 1035 §5.1): backslash and quote are
+// escaped, and unprintable octets become \DDD.
+func fromWireOctets(bs []byte) string {
 	var s strings.Builder
 	consumed := 0
-	for i, b := range msg[off : off+l] {
+	l := len(bs)
+	for i, b := range bs {
 		switch {
 		case b == '"' || b == '\\':
 			if consumed == 0 {
 				s.Grow(l * 2)
 			}
-			s.Write(msg[off+consumed : off+i])
+			s.Write(bs[consumed:i])
 			s.WriteByte('\\')
 			s.WriteByte(b)
 			consumed = i + 1
@@ -282,16 +290,16 @@ func unpackString(msg []byte, off int) (string, int, error) {
 			if consumed == 0 {
 				s.Grow(l * 2)
 			}
-			s.Write(msg[off+consumed : off+i])
+			s.Write(bs[consumed:i])
 			s.WriteString(escapeByte(b))
 			consumed = i + 1
 		}
 	}
 	if consumed == 0 { // no escaping needed
-		return string(msg[off : off+l]), off + l, nil
+		return string(bs)
 	}
-	s.Write(msg[off+consumed : off+l])
-	return s.String(), off + l, nil
+	s.Write(bs[consumed:])
+	return s.String()
 }
 
 func packString(s string, msg []byte, off int) (int, error) {
@@ -447,12 +455,20 @@ func packDataOpt(options []EDNS0, msg []byte, off int) (int, error) {
 }
 
 func unpackStringOctet(msg []byte, off int) (string, int, error) {
-	s := string(msg[off:])
-	return s, len(msg), nil
+	if off > len(msg) {
+		return "", len(msg), &Error{err: "overflow unpacking octet"}
+	}
+	// Store the same escaped presentation form as unpackString / zone
+	// parsing, so packStringOctet (which interprets \DDD and \X) can
+	// round-trip raw 0x5c bytes and other special octets.
+	return fromWireOctets(msg[off:]), len(msg), nil
 }
 
 func packStringOctet(s string, msg []byte, off int) (int, error) {
-	off, err := packOctetString(s, msg, off)
+	// Unlike packOctetString, dns:"octet" fields (CAA.Value, URI.Target)
+	// are not 255-octet <character-string>s and must not inherit the
+	// 256*4+1 presentation-length cap from RFC 1035 character-strings.
+	off, err := appendEscapedOctets(s, msg, off)
 	if err != nil {
 		return len(msg), err
 	}

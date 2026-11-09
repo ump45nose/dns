@@ -3,6 +3,7 @@ package dns
 import (
 	"bytes"
 	"crypto/rsa"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math/rand"
@@ -1536,6 +1537,126 @@ func TestPackCAA(t *testing.T) {
 		t.Fatalf("invalid value for unpacked answer")
 	} else if rr.Flag != 1 {
 		t.Fatalf("invalid flag for unpacked answer")
+	}
+}
+
+// Issue #1735: dns:"octet" fields must round-trip raw 0x5c bytes and
+// values longer than the 1025-byte <character-string> presentation cap.
+func TestCAAOctetUnpackPackRoundTrip(t *testing.T) {
+	build := func(val []byte) []byte {
+		req := new(Msg)
+		req.SetQuestion("example.com.", TypeCAA)
+		hdr, err := req.Pack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		hdr[2] = 0x84         // QR=1, AA=1
+		hdr[6], hdr[7] = 0, 1 // ANCOUNT=1
+
+		var rr bytes.Buffer
+		rr.Write([]byte{0xc0, 0x0c})
+		_ = binary.Write(&rr, binary.BigEndian, uint16(TypeCAA))
+		_ = binary.Write(&rr, binary.BigEndian, uint16(ClassINET))
+		_ = binary.Write(&rr, binary.BigEndian, uint32(60))
+		_ = binary.Write(&rr, binary.BigEndian, uint16(2+5+len(val)))
+		rr.WriteByte(0)
+		rr.WriteByte(5)
+		rr.WriteString("issue")
+		rr.Write(val)
+		return append(hdr, rr.Bytes()...)
+	}
+
+	orig := []byte{0x01, 0x5c, 'a', 0x5c, '1', '2', '3', 0x02}
+	m := new(Msg)
+	if err := m.Unpack(build(orig)); err != nil {
+		t.Fatalf("Unpack: %v", err)
+	}
+	repacked, err := m.Pack()
+	if err != nil {
+		t.Fatalf("Pack after Unpack: %v", err)
+	}
+	m2 := new(Msg)
+	if err := m2.Unpack(repacked); err != nil {
+		t.Fatalf("Unpack of repacked: %v", err)
+	}
+	if m.Answer[0].(*CAA).Value != fromWireOctets(orig) {
+		t.Fatalf("unpacked Value = %q, want %q", m.Answer[0].(*CAA).Value, fromWireOctets(orig))
+	}
+	if m2.Answer[0].(*CAA).Value != m.Answer[0].(*CAA).Value {
+		t.Fatalf("repacked Value = %q, want %q", m2.Answer[0].(*CAA).Value, m.Answer[0].(*CAA).Value)
+	}
+	// Recover wire octets from the presentation form via a third pack/unpack
+	// of just the RR and compare the raw rdata value.
+	rr := m.Answer[0].(*CAA)
+	buf := make([]byte, 4096)
+	n, err := PackRR(rr, buf, 0, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr2, _, err := UnpackRR(buf[:n], 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rr2.(*CAA).Value != rr.Value {
+		t.Fatalf("RR pack/unpack Value %q != %q", rr2.(*CAA).Value, rr.Value)
+	}
+	// Compare wire RDATA of the original message vs the repacked message
+	// by unpacking both CAA RRs and checking they String() equally, and
+	// that the raw value bytes match orig after presentation decoding.
+	if rr2.(*CAA).String() != rr.String() {
+		t.Fatalf("string mismatch %q vs %q", rr2.(*CAA).String(), rr.String())
+	}
+
+	// Directly check presentation decoding yields orig.
+	decoded := make([]byte, 0, len(orig))
+	s := rr.Value
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+			if i == len(s) {
+				break
+			}
+			if isDDD(s[i:]) {
+				decoded = append(decoded, dddToByte(s[i:]))
+				i += 2
+			} else {
+				decoded = append(decoded, s[i])
+			}
+		} else {
+			decoded = append(decoded, s[i])
+		}
+	}
+	if !bytes.Equal(decoded, orig) {
+		t.Fatalf("decoded Value %x != orig %x (presentation %q)", decoded, orig, rr.Value)
+	}
+
+	long := bytes.Repeat([]byte{'A'}, 1100)
+	mLong := new(Msg)
+	if err := mLong.Unpack(build(long)); err != nil {
+		t.Fatalf("Unpack 1100-byte Value: %v", err)
+	}
+	if _, err := mLong.Pack(); err != nil {
+		t.Fatalf("Pack 1100-byte Value: %v", err)
+	}
+	if got := mLong.Answer[0].(*CAA).Value; got != string(long) {
+		t.Fatalf("1100-byte Value len=%d, want 1100", len(got))
+	}
+
+	// Zone-file parsing of a backslash (\\134) must also pack/unpack losslessly.
+	parsed, err := NewRR(`example.net. CAA 0 issue "pre\134post"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err = PackRR(parsed, buf, 0, nil, false)
+	if err != nil {
+		t.Fatalf("PackRR zone-parsed backslash: %v", err)
+	}
+	unpacked, _, err := UnpackRR(buf[:n], 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.String() != unpacked.String() {
+		t.Fatalf("zone parse/pack/unpack:\n%s\n%s", parsed.String(), unpacked.String())
 	}
 }
 

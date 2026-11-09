@@ -508,6 +508,13 @@ func packOctetString(s string, msg []byte, offset int) (int, error) {
 	if offset >= len(msg) || len(s) > 256*4+1 {
 		return offset, ErrBuf
 	}
+	return appendEscapedOctets(s, msg, offset)
+}
+
+// appendEscapedOctets writes presentation-escaped octets (\DDD or \X) as raw
+// wire bytes. It does not enforce the 255-octet <character-string> cap; callers
+// that need that cap (packOctetString) must check it themselves.
+func appendEscapedOctets(s string, msg []byte, offset int) (int, error) {
 	for i := 0; i < len(s); i++ {
 		if len(msg) <= offset {
 			return offset, ErrBuf
